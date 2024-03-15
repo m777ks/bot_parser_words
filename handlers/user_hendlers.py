@@ -26,6 +26,15 @@ async def create_pool():
         database=config.postgres.database, host=config.postgres.ip)
 
 
+async def get_subscription_type(user_id):
+    pool = await create_pool()
+    async with pool.acquire() as conn:
+        subscription_type = await conn.fetchval(
+            'SELECT subscription_type FROM users_bot WHERE user_id = $1', user_id
+        )
+    return subscription_type
+
+
 # Функция для обновления подписки
 async def daily_check_subscription(bot: Bot):
     # ваш код проверки и обновления подписки
@@ -129,90 +138,138 @@ async def process_register_email(message: Message, state: FSMContext):
 async def process_subscription_status(message: Message, state: FSMContext):
     user_id = message.from_user.id
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        try:
-            await message.delete()
+    await message.delete()
+    try:
+        subscription_type = await get_subscription_type(user_id)
+        async with pool.acquire() as conn:
             user_data = await conn.fetchrow(
                 'SELECT subscriptions_start, subscriptions_stop, access FROM users_bot WHERE user_id = $1',
                 user_id
-            )
-            if user_data:
-                subscriptions_start, subscriptions_stop, access = user_data
-                if access:
-                    message_text = (
-                        f"Ваша подписка <b>активна</b>.\n"
-                        f"Дата окончания подписки: {subscriptions_stop.strftime('%d.%m.%Y')}"
-                    )
-                else:
-                    message_text = (f"Ваша подписка <b>Истекла</b>.\n"
-                                    f"Дата окончания подписки: {subscriptions_stop.strftime('%d.%m.%Y')}")
+        )
+        if user_data:
+            subscriptions_start, subscriptions_stop, access = user_data
+            if access:
+                message_text = (
+                    f"Тип вашей подписки: {LEXICON[subscription_type]}\n"
+                    f"Ваша подписка <b>активна</b>.\n"
+                    f"Дата окончания подписки: {subscriptions_stop.strftime('%d.%m.%Y')}"
+                )
             else:
-                message_text = "Вы не зарегистрированы или у вас нет активной подписки."
-        except Exception as e:
-            message_text = f"Произошла ошибка: {e}"
+                message_text = (
+                    f"Тип вашей подписки: {LEXICON[subscription_type]}\n"
+                    f"Ваша подписка <b>Истекла</b>.\n"
+                    f"Дата окончания подписки: {subscriptions_stop.strftime('%d.%m.%Y')}")
+        else:
+            message_text = "Вы не зарегистрированы или у вас нет активной подписки."
+    except Exception as e:
+        message_text = f"Произошла ошибка: {e}"
 
-        await message.answer(message_text)
+    await message.answer(message_text)
     await pool.close()
 
 
 @router.message(Command(commands='new_session'), StateFilter(default_state))
 async def start_new_session(message: Message, state: FSMContext):
     await message.delete()
-    # Отправляем запрос пользователю
-    await message.answer('Если вы хотите прервать - '
-                         'отправьте команду\n /cancel\n\n'
-                         'Название не должно превышать 18 символов и в нем не должно быть "_"\n'
-                         'Введите название новой сессии:')
+    user_id = message.from_user.id
+    pool = await create_pool()
+    try:
+        # Получаем тип подписки пользователя
+        subscription_type = await get_subscription_type(user_id)
+        # Проверяем ограничения по количеству сессий
+        async with pool.acquire() as conn:
+            sessions_count = await conn.fetchval(
+                'SELECT COUNT(DISTINCT sessions) FROM user_group WHERE user_id = $1', user_id
+            )
+        print(sessions_count)
+        if subscription_type == 'standard' and int(sessions_count) >= 3:
+            await message.answer("Достигнут лимит по количеству поисковых запросов для вашего типа подписки.")
+            return
+        elif subscription_type == 'premium' and sessions_count >= 10:
+            await message.answer("Достигнут лимит по количеству поисковых запросов для вашего типа подписки.")
 
-    # Устанавливаем состояние ожидания названия сессии
-    await state.set_state(FSMFillForm.waiting_for_session_name)
+            return
+        else:
+            # Отправляем запрос пользователю
+            await message.answer('Если вы хотите прервать - '
+                                 'отправьте команду\n /cancel\n\n'
+                                 'Название не должно превышать 18 символов и в нем не должно быть "_"\n'
+                                 'Введите название новой сессии:')
+
+            # Устанавливаем состояние ожидания названия сессии
+            await state.set_state(FSMFillForm.waiting_for_session_name)
+    except Exception as e:
+        print(f"Произошла ошибка: {str(e)}")
+    finally:
+        await pool.close()
 
 
 @router.message(StateFilter(FSMFillForm.waiting_for_session_name), F.text)
 async def process_session_name(message: Message, state: FSMContext):
     session_name = message.text.strip()
-    # Проверяем длину названия сессии
-    if len(session_name) > 18:
-        await message.answer(
-            "Название сессии не должно быть длиннее 18 символов. Пожалуйста, выберите другое название.")
-        return
-
-    # Проверяем, что название сессии не пустое
-    if not session_name:
-        await message.answer("Название сессии не может быть пустым. Попробуйте еще раз.")
-        return
-        # Проверяем, что название сессии не содержит символ нижнего подчеркивания
-    if '_' in session_name:
-        await message.answer(
-            "Название сессии не должно содержать символ нижнего подчеркивания (_). Попробуйте еще раз.")
-        return
-
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        user_id = message.from_user.id
-
-        # Проверяем, существует ли уже сессия с таким названием для этого пользователя
-        existing_session = await conn.fetchval(
-            'SELECT sessions FROM user_group WHERE user_id = $1 AND sessions = $2', user_id, session_name
-        )
-        if existing_session:
-            await message.answer('Если вы хотите прервать - '
-                                 'отправьте команду\n /cancel\n\n'
-                                 "Сессия с таким названием уже существует. Пожалуйста, выберите другое название.")
+    try:
+        # Проверяем длину названия сессии
+        if len(session_name) > 18:
+            await message.answer(
+                "Название сессии не должно быть длиннее 18 символов. Пожалуйста, выберите другое название.")
             return
 
-        # Создаем новую сессию в таблице user_group
-        await conn.execute('INSERT INTO user_group (user_id, sessions) VALUES ($1, $2)', user_id, session_name)
+        # Проверяем, что название сессии не пустое
+        if not session_name:
+            await message.answer("Название поискового запроса не может быть пустым. Попробуйте еще раз.")
+            return
 
-        # Создаем новую сессию в таблице words
-        await conn.execute('INSERT INTO words (user_id, sessions) VALUES ($1, $2)', user_id, session_name)
-    await pool.close()
+        # Проверяем, что название сессии не содержит символ нижнего подчеркивания
+        if '_' in session_name:
+            await message.answer(
+                "Название поискового запроса не должно содержать символ нижнего подчеркивания (_). Попробуйте еще раз.")
+            return
 
-    # Отправляем сообщение о создании сессии
-    await message.answer(f"Сессия '{session_name}' создана.")
+        async with pool.acquire() as conn:
+            user_id = message.from_user.id
 
-    # Сбрасываем состояние
-    await state.clear()
+            # Проверяем, существует ли уже сессия с таким названием для этого пользователя
+            existing_session = await conn.fetchval(
+                'SELECT sessions FROM user_group WHERE user_id = $1 AND sessions = $2', user_id, session_name
+            )
+            if existing_session:
+                await message.answer('Если вы хотите прервать - '
+                                     'отправьте команду\n /cancel\n\n'
+                                     "Поисковый запрос с таким названием уже существует."
+                                     " Пожалуйста, выберите другое название.")
+                return
+
+            # Создаем новую сессию в таблице user_group
+            await conn.execute('INSERT INTO user_group (user_id, sessions) VALUES ($1, $2)', user_id, session_name)
+
+            # Создаем новую сессию в таблице words
+            await conn.execute('INSERT INTO words (user_id, sessions) VALUES ($1, $2)', user_id, session_name)
+
+        # Отправляем сообщение о создании сессии
+        await message.answer(f"Поисковый запрос '{session_name}' создан.")
+
+        async with pool.acquire() as conn:
+            sessions = await conn.fetch(
+                'SELECT sessions FROM user_group WHERE user_id = $1', user_id
+            )
+            # await pool.close()
+        if sessions:
+            # Формируем строку сессий для ответа пользователю
+            # Используем множество для уникальных значений сессий
+            session_set = set()
+            for session in sessions:
+                session_set.add(session[0])
+            session_list = list(session_set)
+
+            await message.answer(text=LEXICON[message.text],
+                                 reply_markup=create_list_keyboard(*session_list))
+    except Exception as e:
+        print(f"Произошла ошибка: {str(e)}")
+    finally:
+        await pool.close()
+        # Сбрасываем состояние
+        await state.clear()
 
 
 # Этот хэндлер будет срабатывать, если во время ввода имени
@@ -249,7 +306,7 @@ async def process_sessions_command(message: Message):
             await message.answer(text=LEXICON[message.text],
                                  reply_markup=create_list_keyboard(*session_list))
         else:
-            await message.answer("У вас нет активных сессий.")
+            await message.answer("У вас нет поисковых запросов.")
     except Exception as e:
         # Обработка исключения, например, отправка сообщения об ошибке
         print(f"Произошла ошибка при получении списка сессий: {str(e)}")
@@ -277,10 +334,10 @@ async def process_sessions_button(callback: CallbackQuery):
                 await callback.message.answer(text=LEXICON['/my_sessions'],
                                               reply_markup=create_list_keyboard(*session_list))
             else:
-                await callback.message.answer("У вас нет активных сессий.")
+                await callback.message.answer("У вас нет поисковых запросов.")
     except Exception as e:
         # Обработка исключения, например, отправка сообщения об ошибке
-        await callback.message.answer(f"Произошла ошибка при получении списка сессий: {str(e)}")
+        print(f"Произошла ошибка при получении списка сессий: {str(e)}")
     finally:
         await pool.close()
 
@@ -307,7 +364,7 @@ async def process_edit_press(callback: CallbackQuery):
             await callback.message.edit_text(text=LEXICON[callback.data],
                                              reply_markup=create_edit_keyboard(*session_list))
         else:
-            await callback.answer("У вас нет активных сессий.")
+            await callback.answer("У вас нет поисковых запросов.")
     except Exception as e:
         # Обработка исключения, например, отправка сообщения об ошибке
         await callback.answer(f"Произошла ошибка при получении списка сессий: {str(e)}")
@@ -347,7 +404,7 @@ async def process_del_bookmark_press(callback: CallbackQuery):
                                                  reply_markup=create_edit_keyboard(*session_list))
             else:
                 await callback.message.delete()
-                await callback.answer("У вас нет активных сессий.")
+                await callback.answer("У вас нет поисковых запросов.")
 
     except Exception as e:
         # Обработка исключения, например, отправка сообщения об ошибке
@@ -523,18 +580,11 @@ async def process_edit_words(message: Message, state: FSMContext):
                 'SELECT words_exception FROM words WHERE user_id = $1 AND sessions = $2', user_id, session_name
             )
 
-            if existing_words:
-                # Запись существует, выполняем операцию UPDATE
-                await conn.execute(
-                    'UPDATE words SET words_exception = $1 WHERE user_id = $2 AND sessions = $3',
-                    new_words, user_id, session_name
-                )
-            else:
-                # Запись не существует,
-                await conn.execute(
-                    'UPDATE words SET words_exception = $1 WHERE user_id = $2 AND sessions = $3',
-                    new_words, user_id, session_name
-                )
+            # Запись существует, выполняем операцию UPDATE
+            await conn.execute(
+                'UPDATE words SET words_exception = $1 WHERE user_id = $2 AND sessions = $3',
+                new_words, user_id, session_name
+            )
 
         await message.answer("Слова исключения успешно обновлены.")
         markup = buttons_words_group(session_name=session_name)
@@ -559,7 +609,8 @@ async def process_group_list(callback: CallbackQuery):
                 'SELECT group_link FROM user_group WHERE user_id = $1 AND sessions = $2', user_id, session_name
             )
             # await pool.close()
-        if group_link:
+
+        if group_link[0]['group_link'] != None:
             group_list = set()
             for group in group_link:
                 group_list.add(group[0])
@@ -591,22 +642,40 @@ async def process_group_list(callback: CallbackQuery):
 
 @router.callback_query(lambda c: c.data.startswith('button_add_g_'))
 async def process_add_group(callback: CallbackQuery, state: FSMContext):
+    pool = await create_pool()
     try:
         session_name = callback.data.split('_')[-1]
+        user_id = callback.from_user.id
 
         await state.update_data(session_name=session_name)
-        await state.set_state(FSMFillForm.fill_add_group)
+        # Получаем тип подписки пользователя
+        subscription_type = await get_subscription_type(user_id)
+        # Проверяем ограничения по количеству сессий
+        async with pool.acquire() as conn:
+            group_count = await conn.fetchval(
+                'SELECT COUNT(group_link) FROM user_group WHERE user_id = $1 AND sessions = $2', user_id, session_name
+            )
 
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Отмена', callback_data='cancel')]])
+        if subscription_type == 'standard' and group_count >= 5:
+            await callback.message.answer("Достигнут лимит по количеству групп для вашего типа подписки.")
+            return
+        elif subscription_type == 'premium' and group_count >= 15:
+            await callback.message.answer("Достигнут лимит по количеству групп для вашего типа подписки.")
+            return
+        else:
+            await state.set_state(FSMFillForm.fill_add_group)
 
-        await callback.message.edit_text(text='Пожалуйста, пришлите ссылку вида: https://t.me/your_group\n'
-                                              'или @your_group\n'
-                                              'Группы можно добавлять списком через запятую.\n\n'
-                                              'Если вы хотите прервать - нажмите отмена',
-                                         reply_markup=markup)
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Отмена', callback_data='cancel')]])
+
+            await callback.message.edit_text(text='Пожалуйста, пришлите ссылку вида: https://t.me/your_group\n'
+                                                  'или @your_group\n'
+                                                  'Группы можно добавлять списком через запятую.\n\n'
+                                                  'Если вы хотите прервать - нажмите отмена',
+                                             reply_markup=markup)
     except Exception as e:
         print(f"Произошла ошибка: {str(e)}")
-
+    finally:
+        await pool.close()
 
 @router.message(StateFilter(FSMFillForm.fill_add_group), F.text)
 async def process_add_groups(message: Message, state: FSMContext):
@@ -615,11 +684,12 @@ async def process_add_groups(message: Message, state: FSMContext):
         data = await state.get_data()
         session_name = data.get('session_name')
         user_id = message.from_user.id
+        # Получаем тип подписки пользователя
+        subscription_type = await get_subscription_type(user_id)
 
         group_links = message.text.strip().split(',')
         valid_links = []
         invalid_links = []
-
 
         for link in group_links:
             link = link.strip()
@@ -638,7 +708,6 @@ async def process_add_groups(message: Message, state: FSMContext):
             else:
                 invalid_links.append(link)
 
-
         async with pool.acquire() as conn:
             # Получаем текущий список групп для данного пользователя и сессии
             current_groups = await conn.fetch(
@@ -646,18 +715,34 @@ async def process_add_groups(message: Message, state: FSMContext):
                 user_id, session_name
             )
 
-            # Добавляем новые группы к текущему списку групп
             for link in valid_links:
-                if link not in [group['group_link'] for group in current_groups]:
+                if not current_groups or current_groups[0]['group_link'] is None:
                     await conn.execute(
-                        'INSERT INTO user_group (user_id, sessions, group_link) VALUES ($1, $2, $3)',
-                        user_id, session_name, link
+                        'UPDATE user_group SET group_link = $1 WHERE user_id = $2 AND sessions = $3',
+                        link, user_id, session_name
                     )
+                else:
+                    if link not in [group['group_link'] for group in current_groups]:
+                        await conn.execute(
+                            'INSERT INTO user_group (user_id, sessions, group_link) VALUES ($1, $2, $3)',
+                            user_id, session_name, link
+                        )
+
+                group_count = await conn.fetchval(
+                    'SELECT COUNT(group_link) FROM user_group WHERE user_id = $1 AND sessions = $2',
+                    user_id, session_name
+                )
+                if subscription_type == 'standard' and group_count >= 5:
+                    await message.answer("Достигнут лимит по количеству групп для вашего типа подписки.")
+                    return
+                elif subscription_type == 'premium' and group_count >= 15:
+                    await message.answer("Достигнут лимит по количеству групп для вашего типа подписки.")
+                    return
+
 
         if invalid_links:
             await message.answer(f"Следующие ссылки имеют неверный формат и не были добавлены:\n"
                                  f"{', '.join(invalid_links)}")
-        await message.answer("Группы успешно добавлены.")
 
         async with pool.acquire() as conn:
             group_link = await conn.fetch(

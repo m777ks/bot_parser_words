@@ -1,22 +1,25 @@
 CREATE TABLE users_bot
 (
-	user_id bigint PRIMARY KEY,
-	email varchar(128) NOT NULL,
-	subscriptions_start date,
-	subscriptions_stop date,
-	acces bool NOT NULL
+    user_id bigint PRIMARY KEY,
+    email varchar(128) NOT NULL,
+    subscriptions_start date,
+    subscriptions_stop date,
+    access bool NOT NULL,
+    subscription_type varchar(10) NOT NULL DEFAULT 'standard' CHECK (subscription_type IN ('standard', 'premium', 'admin'))
 );
+
+
 CREATE TABLE user_group
 (
-    id_user_group SERIAL PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     user_id bigint NOT NULL,
     sessions varchar(128),
-    group_link varchar(128),
-    UNIQUE(user_id, sessions, group_link)
+    group_link varchar(128)
 );
 
 CREATE TABLE words
 (
+    id SERIAL PRIMARY KEY,
 	user_id bigint NOT NULL,
 	sessions varchar(128),
 	words text,
